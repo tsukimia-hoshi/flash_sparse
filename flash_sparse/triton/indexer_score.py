@@ -136,7 +136,7 @@ def indexer_score(
     ``scores: [B, S, T]`` FP32. Apply causal masking and top-k externally.
     """
     assert q.is_cuda and k_idx.is_cuda and weights.is_cuda
-    assert q.dim == 4 and k_idx.dim == 3 and weights.dim == 3
+    assert q.dim() == 4 and k_idx.dim() == 3 and weights.dim() == 3
     B, S, H_I, D_I = q.shape
     B2, T, D_I2 = k_idx.shape
     assert B2 == B and D_I2 == D_I, f"q/k shape mismatch: q={q.shape}, k={k_idx.shape}"
@@ -149,34 +149,34 @@ def indexer_score(
     if H_I < 16:
         raise ValueError(f"H_I ({H_I}) must be >= 16 for tl.dot. Pad heads with zeros if needed.")
 
-        scores = torch.empty((B, S, T), device=q.device, dtype=torch.float32)
-        # Grid: (S, B, T_blocks) — S in axis 0 (CUDA X dim, no practical limit) so
-        # the kernel scales to S > 65535 without hitting the grid-Y limit.
-        grid = lambda meta: (S, B, triton.cdiv(T, meta["BLOCK_T"]))
+    scores = torch.empty((B, S, T), device=q.device, dtype=torch.float32)
+    # Grid: (S, B, T_blocks) — S in axis 0 (CUDA X dim, no practical limit) so
+    # the kernel scales to S > 65535 without hitting the grid-Y limit.
+    grid = lambda meta: (S, B, triton.cdiv(T, meta["BLOCK_T"]))
 
-        _indexer_score_kernel[grid](
-            q,
-            k_idx,
-            weights,
-            scores,
-            q.stride(0),
-            q.stride(1),
-            q.stride(2),
-            q.stride(3),
-            k_idx.stride(0),
-            k_idx.stride(1),
-            k_idx.stride(2),
-            weights.stride(0),
-            weights.stride(1),
-            weights.stride(2),
-            scores.stride(0),
-            scores.stride(1),
-            scores.stride(2),
-            T=T,
-            H_I=H_I,
-            D_I=D_I,
-        )
-        return scores
+    _indexer_score_kernel[grid](
+        q,
+        k_idx,
+        weights,
+        scores,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        q.stride(3),
+        k_idx.stride(0),
+        k_idx.stride(1),
+        k_idx.stride(2),
+        weights.stride(0),
+        weights.stride(1),
+        weights.stride(2),
+        scores.stride(0),
+        scores.stride(1),
+        scores.stride(2),
+        T=T,
+        H_I=H_I,
+        D_I=D_I,
+    )
+    return scores
 
 
 def indexer_score_topk(
@@ -200,9 +200,9 @@ def indexer_score_topk(
     scores = indexer_score(q, k_idx, weights)
     if causal_mask is not None:
         scores = scores.masked_fill(~causal_mask, float("-inf"))
-        k = min(top_k, scores.shape[-1])
-        top_scores, top_idx = scores.topk(k, dim=-1)
-        return top_idx.to(torch.int64), top_scores
+    k = min(top_k, scores.shape[-1])
+    top_scores, top_idx = scores.topk(k, dim=-1)
+    return top_idx.to(torch.int64), top_scores
 
 
 __all__ = ["indexer_score", "indexer_score_topk"]
