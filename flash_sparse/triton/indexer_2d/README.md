@@ -52,24 +52,16 @@ Meaning:
 
 ### `k_idx`
 
-Key indexer tensor. Two layouts are supported.
-
-#### Head-specific key layout
-
-```text
-[B, T, H_k, W_k, H_I, D_I]
-```
-
-This is the preferred 2D contract when each indexer head has its own key vector.
-
-#### Head-shared key layout
+Key indexer tensor with shape:
 
 ```text
 [B, T, H_k, W_k, D_I]
 ```
 
-This compatibility layout matches the native 1D `indexer_score` ABI after the
-local 2D halo is flattened.
+K is intentionally head-shared, matching the original 1D `indexer_score` ABI:
+Q has an indexer-head dimension, but K does not. After the local 2D halo is
+flattened, the scorer sees the same contract as the 1D indexer:
+`[B, Q_local, H_I, D_I]` queries against `[B, K_local, D_I]` keys.
 
 Meaning:
 
@@ -212,9 +204,10 @@ For each query tile, the implementation:
 4. Runs `topk` over only the local halo candidates.
 5. Maps local top-k positions back to absolute flattened key-grid indices.
 
-The head-shared key layout delegates to the native Triton `indexer_score` path on
-CUDA. The head-specific key layout is decomposed into per-head native calls on
-CUDA and has an equivalent PyTorch implementation for CPU or small-head debugging.
+The flattened local scorer delegates to the native Triton `indexer_score` path on
+CUDA. The CPU/debug fallback uses the same head-shared-K formula in PyTorch:
+every Q indexer head is dotted with the same K vector, then per-head scores are
+weighted and summed.
 
 ## Non-causal behavior
 
@@ -241,7 +234,7 @@ H_I, D_I = 16, 64
 top_k = 32
 
 q = torch.randn(B, H, W, H_I, D_I, device="cuda", dtype=torch.bfloat16)
-k_idx = torch.randn(B, T, H, W, H_I, D_I, device="cuda", dtype=torch.bfloat16)
+k_idx = torch.randn(B, T, H, W, D_I, device="cuda", dtype=torch.bfloat16)
 weights = torch.randn(B, H, W, H_I, device="cuda", dtype=torch.float32)
 
 top_idx, top_scores = chunked_indexer_2d_topk(
@@ -273,7 +266,7 @@ W_k = (W + m_2d - 1) // m_2d
 top_k = 32
 
 q = torch.randn(B, H, W, H_I, D_I, device="cuda", dtype=torch.bfloat16)
-k_idx = torch.randn(B, T, H_k, W_k, H_I, D_I, device="cuda", dtype=torch.bfloat16)
+k_idx = torch.randn(B, T, H_k, W_k, D_I, device="cuda", dtype=torch.bfloat16)
 weights = torch.randn(B, H, W, H_I, device="cuda", dtype=torch.float32)
 
 top_idx, top_scores = chunked_indexer_2d_topk(

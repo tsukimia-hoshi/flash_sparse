@@ -117,59 +117,24 @@ def _make_halo_global_indices(
     return global_indices.reshape(-1)
 
 
-def _score_head_specific_k(
-    q_tile: torch.Tensor,
-    k_halo: torch.Tensor,
-    weights_tile: torch.Tensor,
-) -> torch.Tensor:
-    """Score head-specific K tensors.
-
-    ``indexer_score``'s native 1D contract uses head-shared keys
-    ``[B, T_local, D]``.  The requested 2D contract carries head-specific keys
-    ``[B, T_local, H_I, D_I]``.  On CUDA, decompose this layout into one native
-    ``indexer_score`` call per key head and accumulate the exact score.  The
-    PyTorch path keeps CPU tests and small-head debugging usable.
-    """
-    if q_tile.is_cuda and k_halo.is_cuda and weights_tile.is_cuda and q_tile.shape[2] >= 16:
-        scores = torch.zeros(
-            (q_tile.shape[0], q_tile.shape[1], k_halo.shape[1]),
-            dtype=torch.float32,
-            device=q_tile.device,
-        )
-        for head_idx in range(q_tile.shape[2]):
-            head_weights = torch.zeros_like(weights_tile)
-            head_weights[:, :, head_idx] = weights_tile[:, :, head_idx]
-            scores = scores + indexer_score(q_tile, k_halo[:, :, head_idx, :].contiguous(), head_weights)
-        return scores
-
-    work_dtype = torch.float32
-    raw = torch.einsum("bqhd,bkhd->bqhk", q_tile.to(work_dtype), k_halo.to(work_dtype))
-    scores = torch.relu(raw) * weights_tile.to(work_dtype).unsqueeze(-1)
-    return scores.sum(dim=2)
-
-
 def _score_local_halo(
     q_tile: torch.Tensor,
     k_halo: torch.Tensor,
     weights_tile: torch.Tensor,
 ) -> torch.Tensor:
-    """Score a flattened Q tile against a flattened K halo.
+    """Score a flattened Q tile against a flattened, head-shared K halo.
 
-    The head-shared key layout delegates directly to the native Triton
-    ``indexer_score`` on CUDA.  The head-specific key layout is decomposed into
-    per-head native calls on CUDA and uses an equivalent PyTorch implementation
-    otherwise.
+    This matches the original 1D lightning-indexer contract: Q has an indexer
+    head dimension, K has no head dimension, and per-head scores are weighted
+    and summed.
     """
-    if k_halo.dim() == 3:
-        if q_tile.is_cuda and k_halo.is_cuda and weights_tile.is_cuda:
-            return indexer_score(q_tile, k_halo, weights_tile)
-        work_dtype = torch.float32
-        raw = torch.einsum("bqhd,bkd->bqhk", q_tile.to(work_dtype), k_halo.to(work_dtype))
-        scores = torch.relu(raw) * weights_tile.to(work_dtype).unsqueeze(-1)
-        return scores.sum(dim=2)
-    if k_halo.dim() == 4:
-        return _score_head_specific_k(q_tile, k_halo, weights_tile)
-    raise ValueError(f"flattened k_halo must be [B,N,D] or [B,N,H_I,D_I], got {tuple(k_halo.shape)}")
+    if q_tile.is_cuda and k_halo.is_cuda and weights_tile.is_cuda:
+        return indexer_score(q_tile, k_halo, weights_tile)
+
+    work_dtype = torch.float32
+    raw = torch.einsum("bqhd,bkd->bqhk", q_tile.to(work_dtype), k_halo.to(work_dtype))
+    scores = torch.relu(raw) * weights_tile.to(work_dtype).unsqueeze(-1)
+    return scores.sum(dim=2)
 
 
 def chunked_indexer_2d_topk(
@@ -188,12 +153,11 @@ def chunked_indexer_2d_topk(
 
     Args:
         q: Query indexer tensor ``[B, H, W, H_I, D_I]``.
-        k_idx: Key indexer tensor. The requested head-specific layout is
-            ``[B, T, H_k, W_k, H_I, D_I]``. A head-shared compatibility layout
-            ``[B, T, H_k, W_k, D_I]`` is also accepted and is flattened into the
-            native ``indexer_score`` ABI. ``H_k`` and ``W_k`` equal ``H`` and
-            ``W`` when uncompressed, or ``ceil(H / m_h)`` and ``ceil(W / m_w)``
-            when spatial compression is enabled.
+        k_idx: Head-shared key indexer tensor ``[B, T, H_k, W_k, D_I]``.
+            This intentionally matches the original 1D lightning-indexer
+            contract: Q has indexer heads, K does not. ``H_k`` and ``W_k`` equal
+            ``H`` and ``W`` when uncompressed, or ``ceil(H / m_h)`` and
+            ``ceil(W / m_w)`` when spatial compression is enabled.
         weights: Per-query head weights ``[B, H, W, H_I]``.
         top_k: Number of local halo keys selected for each spatial query.
         tile_h: Query tile height for the outer 2D loop.
@@ -228,8 +192,8 @@ def chunked_indexer_2d_topk(
 
     if q.dim() != 5:
         raise ValueError(f"q must be [B,H,W,H_I,D_I], got {tuple(q.shape)}")
-    if k_idx.dim() not in (5, 6):
-        raise ValueError(f"k_idx must be [B,T,H,W,D_I] or [B,T,H,W,H_I,D_I], got {tuple(k_idx.shape)}")
+    if k_idx.dim() != 5:
+        raise ValueError(f"k_idx must be head-shared [B,T,H_k,W_k,D_I], got {tuple(k_idx.shape)}")
     if weights.dim() != 4:
         raise ValueError(f"weights must be [B,H,W,H_I], got {tuple(weights.shape)}")
 
@@ -240,28 +204,13 @@ def chunked_indexer_2d_topk(
     expected_key_h = _ceil_div(image_h, compression_h)
     expected_key_w = _ceil_div(image_w, compression_w)
 
-    if k_idx.dim() == 6:
-        B_k, num_frames, key_h, key_w, key_heads, key_dim = k_idx.shape
-        if (B_k, key_h, key_w, key_heads, key_dim) != (
-            B,
-            expected_key_h,
-            expected_key_w,
-            num_heads,
-            head_dim,
-        ):
-            raise ValueError(
-                "head-specific k_idx shape mismatch: expected "
-                f"{(B, num_frames, expected_key_h, expected_key_w, num_heads, head_dim)} "
-                f"for compression_rate={(compression_h, compression_w)}, got {tuple(k_idx.shape)}"
-            )
-    else:
-        B_k, num_frames, key_h, key_w, key_dim = k_idx.shape
-        if (B_k, key_h, key_w, key_dim) != (B, expected_key_h, expected_key_w, head_dim):
-            raise ValueError(
-                "head-shared k_idx shape mismatch: expected "
-                f"{(B, num_frames, expected_key_h, expected_key_w, head_dim)} "
-                f"for compression_rate={(compression_h, compression_w)}, got {tuple(k_idx.shape)}"
-            )
+    B_k, num_frames, key_h, key_w, key_dim = k_idx.shape
+    if (B_k, key_h, key_w, key_dim) != (B, expected_key_h, expected_key_w, head_dim):
+        raise ValueError(
+            "head-shared k_idx shape mismatch: expected "
+            f"{(B, num_frames, expected_key_h, expected_key_w, head_dim)} "
+            f"for compression_rate={(compression_h, compression_w)}, got {tuple(k_idx.shape)}"
+        )
 
     out_idx = torch.full((B, image_h, image_w, top_k), -1, dtype=torch.int64, device=q.device)
     out_scores = torch.full((B, image_h, image_w, top_k), float("-inf"), dtype=torch.float32, device=q.device)
@@ -292,10 +241,7 @@ def chunked_indexer_2d_topk(
             weights_flat = weights_tile.reshape(B, q_token_count, num_heads)
 
             k_halo = k_idx[:, :, k_h_start:k_h_end, k_w_start:k_w_end].contiguous()
-            if k_idx.dim() == 6:
-                k_flat = k_halo.reshape(B, -1, num_heads, head_dim)
-            else:
-                k_flat = k_halo.reshape(B, -1, head_dim)
+            k_flat = k_halo.reshape(B, -1, head_dim)
 
             scores = _score_local_halo(q_flat, k_flat, weights_flat)
             k_eff = min(top_k, k_flat.shape[1])
